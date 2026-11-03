@@ -1,0 +1,81 @@
+name: ci-check python (fork only)
+
+on:
+  push:
+    branches:
+      - ci-check-pyturso
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MATURIN_PEP517_ARGS: --profile dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Ruff lint (same as upstream)
+        run: uvx ruff@0.5.4 check
+
+      - name: Install the project
+        working-directory: bindings/python
+        run: uv sync --all-extras --dev --all-packages
+
+      - name: Tests with the fix (same file as upstream python.yml)
+        working-directory: bindings/python
+        run: uv run --no-sync pytest tests/test_database.py
+
+      - name: New tests with the fix
+        working-directory: bindings/python
+        run: >-
+          uv run --no-sync pytest
+          "tests/test_database.py::test_binary_constructor"
+          "tests/test_sqlalchemy.py::TestBasicDialectIntegration::test_large_binary_round_trip"
+          "tests/test_sqlalchemy.py::TestDBAPI2ModuleAttributes"
+          "tests/test_sqlalchemy_async.py::test_local_async_large_binary_round_trip"
+
+      - name: Whole sqlalchemy test files (not in upstream CI, info only)
+        working-directory: bindings/python
+        continue-on-error: true
+        run: uv run --no-sync pytest tests/test_sqlalchemy.py tests/test_sqlalchemy_async.py
+
+      - name: New tests fail without the fix
+        working-directory: bindings/python
+        shell: bash
+        run: |
+          set -u
+          git checkout c31842c072d7f7136d32140ffbbc70047bf3688a -- turso
+          git status --short
+          bad=0
+          for t in \
+            "tests/test_database.py::test_binary_constructor[turso]" \
+            "tests/test_sqlalchemy.py::TestBasicDialectIntegration::test_large_binary_round_trip" \
+            "tests/test_sqlalchemy.py::TestDBAPI2ModuleAttributes::test_turso_module_attributes" \
+            "tests/test_sqlalchemy.py::TestDBAPI2ModuleAttributes::test_turso_sync_module_attributes" \
+            "tests/test_sqlalchemy_async.py::test_local_async_large_binary_round_trip"; do
+            if uv run --no-sync pytest -q "$t"; then
+              echo "UNEXPECTED PASS without the fix: $t"
+              bad=1
+            else
+              echo "failed without the fix, as expected: $t"
+            fi
+          done
+          exit $bad
