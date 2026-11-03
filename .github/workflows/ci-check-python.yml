@@ -1,0 +1,240 @@
+name: ci-check python (fork only)
+
+on:
+  push:
+    branches:
+      - ci-check-pyturso-3
+
+permissions:
+  contents: read
+
+jobs:
+  rust-lint:
+    # Exactly the upstream rust.yml commands. Clippy has to run on the whole
+    # workspace: with -p py-turso alone, feature unification differs and
+    # turso_core trips an unfulfilled lint expectation upstream never sees.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check (same as upstream)
+        run: cargo fmt --check
+
+      - name: Clippy (same as upstream)
+        run: cargo clippy --workspace --all-features --all-targets --locked --exclude memory-benchmark -- --deny=warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MATURIN_PEP517_ARGS: --profile dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The proof steps need c31842c (PR parent), b37a33f (binder before the
+          # first follow-up) and a7f8608 (binder before fix 2). Today that is 5
+          # commits: this one, 514b6e2, a7f8608, b37a33f, c31842c. 10 leaves room.
+          fetch-depth: 10
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Ruff lint (same as upstream)
+        run: uvx ruff@0.5.4 check
+
+      # The uv workspace at the repo root requires Python >= 3.13 and
+      # .python-version pins 3.13, so `uv sync` cannot use 3.10 and used 3.13
+      # in both jobs. Test pyturso in its own venv on the matrix Python instead.
+      - name: Create a venv on Python ${{ matrix.python-version }}
+        shell: bash
+        run: |
+          uv venv --no-project --python "${{ matrix.python-version }}" "$RUNNER_TEMP/venv"
+          echo "VIRTUAL_ENV=$RUNNER_TEMP/venv" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install the project (editable, built by maturin)
+        working-directory: bindings/python
+        run: >-
+          uv pip install --python "$VIRTUAL_ENV/bin/python"
+          -e ".[sqlalchemy]"
+          "sqlalchemy==2.0.45" "pytest==9.0.3" "pytest-asyncio==1.3.0"
+
+      - name: Check the tests run on Python ${{ matrix.python-version }}
+        id: pycheck
+        working-directory: bindings/python
+        shell: bash
+        run: |
+          set -u
+          command -v python
+          python --version
+          actual=$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+          if [ "$actual" != "${{ matrix.python-version }}" ]; then
+            echo "WRONG PYTHON: expected ${{ matrix.python-version }}, got $actual"
+            exit 1
+          fi
+          python -c 'import turso._turso as m; print(m.__file__)'
+          uv pip list --python "$VIRTUAL_ENV/bin/python"
+
+      - name: Tests with the fix (same files as upstream python.yml)
+        if: ${{ !cancelled() && steps.pycheck.outcome == 'success' }}
+        # Upstream only tests 3.13+. On 3.10, six existing [sqlite3]-provider tests
+        # fail because Python 3.10's own sqlite3 behaves differently (not turso code).
+        continue-on-error: ${{ matrix.python-version == '3.10' }}
+        working-directory: bindings/python
+        run: python -m pytest tests/test_database.py tests/test_database_aio.py
+
+      - name: New tests with the fix
+        if: ${{ !cancelled() && steps.pycheck.outcome == 'success' }}
+        working-directory: bindings/python
+        run: >-
+          python -m pytest
+          "tests/test_database.py::test_binary_constructor"
+          "tests/test_database.py::test_bytearray_and_memoryview_blob_parameters"
+          "tests/test_database.py::test_non_contiguous_memoryview_parameter_is_rejected"
+          "tests/test_database.py::test_array_blob_parameter"
+          "tests/test_database.py::test_unsupported_parameter_type_is_rejected"
+          "tests/test_database_aio.py::test_bytearray_and_memoryview_blob_parameters"
+          "tests/test_sqlalchemy.py::TestBasicDialectIntegration::test_large_binary_round_trip"
+          "tests/test_sqlalchemy.py::TestDBAPI2ModuleAttributes"
+          "tests/test_sqlalchemy_async.py::test_local_async_large_binary_round_trip"
+
+      - name: Whole sqlalchemy test files (not in upstream CI, info only)
+        if: ${{ !cancelled() && steps.pycheck.outcome == 'success' }}
+        working-directory: bindings/python
+        continue-on-error: true
+        run: python -m pytest tests/test_sqlalchemy.py tests/test_sqlalchemy_async.py
+
+      # The async LargeBinary test is not listed here: with the new binder, the
+      # old adapter's sqlite3.Binary (memoryview) binds fine. The binder step
+      # below covers it.
+      - name: New tests fail without the Binary fix (turso package from c31842c)
+        if: ${{ !cancelled() && steps.pycheck.outcome == 'success' }}
+        working-directory: bindings/python
+        shell: bash
+        run: |
+          set -u
+          git checkout c31842c072d7f7136d32140ffbbc70047bf3688a -- turso || exit 2
+          git status --short
+          bad=0
+          for t in \
+            "tests/test_database.py::test_binary_constructor[turso]" \
+            "tests/test_sqlalchemy.py::TestBasicDialectIntegration::test_large_binary_round_trip" \
+            "tests/test_sqlalchemy.py::TestDBAPI2ModuleAttributes::test_turso_module_attributes" \
+            "tests/test_sqlalchemy.py::TestDBAPI2ModuleAttributes::test_turso_sync_module_attributes"; do
+            code=0
+            out=$(python -m pytest -q "$t" 2>&1) || code=$?
+            echo "$out"
+            if [ "$code" -eq 0 ]; then
+              echo "UNEXPECTED PASS without the fix: $t"
+              bad=1
+            elif [ "$code" -eq 1 ] && echo "$out" | grep -q "has no attribute 'Binary'"; then
+              echo "failed without the fix, as expected: $t"
+            else
+              echo "WRONG FAILURE REASON (exit $code): $t"
+              bad=1
+            fi
+          done
+          exit $bad
+
+      - name: New tests fail without the binder fix (src/turso.rs from b37a33f)
+        if: ${{ !cancelled() && steps.pycheck.outcome == 'success' }}
+        working-directory: bindings/python
+        shell: bash
+        run: |
+          set -u
+          git checkout HEAD -- turso || exit 2
+          git checkout b37a33f1fe4c488d6a5762ef154205367d9f9f48 -- src/turso.rs || exit 2
+          git status --short
+          ext=$(python -c 'import turso._turso as m; print(m.__file__)') || exit 2
+          before=$(sha256sum "$ext")
+          uv pip install --python "$VIRTUAL_ENV/bin/python" --no-deps --reinstall-package pyturso -e . || exit 2
+          after=$(sha256sum "$ext")
+          if [ "$before" = "$after" ]; then
+            echo "The extension was not rebuilt: $ext"
+            exit 2
+          fi
+          bad=0
+          for t in \
+            "tests/test_database.py::test_bytearray_and_memoryview_blob_parameters[turso]" \
+            "tests/test_database.py::test_non_contiguous_memoryview_parameter_is_rejected" \
+            "tests/test_database.py::test_binary_constructor[turso]" \
+            "tests/test_database_aio.py::test_bytearray_and_memoryview_blob_parameters" \
+            "tests/test_sqlalchemy.py::TestBasicDialectIntegration::test_large_binary_round_trip" \
+            "tests/test_sqlalchemy_async.py::test_local_async_large_binary_round_trip"; do
+            code=0
+            out=$(python -m pytest -q "$t" 2>&1) || code=$?
+            echo "$out"
+            if [ "$code" -eq 0 ]; then
+              echo "UNEXPECTED PASS without the fix: $t"
+              bad=1
+            elif [ "$code" -eq 1 ] && echo "$out" | grep -q "unexpected parameter value"; then
+              echo "failed without the fix, as expected: $t"
+            else
+              echo "WRONG FAILURE REASON (exit $code): $t"
+              bad=1
+            fi
+          done
+          exit $bad
+
+      - name: New tests fail without fix 2 (src/turso.rs from a7f8608)
+        if: ${{ !cancelled() && steps.pycheck.outcome == 'success' }}
+        working-directory: bindings/python
+        shell: bash
+        run: |
+          set -u
+          git checkout a7f86081d86481be4dcc469d336426d729f38ee1 -- src/turso.rs || exit 2
+          git status --short
+          ext=$(python -c 'import turso._turso as m; print(m.__file__)') || exit 2
+          before=$(sha256sum "$ext")
+          uv pip install --python "$VIRTUAL_ENV/bin/python" --no-deps --reinstall-package pyturso -e . || exit 2
+          after=$(sha256sum "$ext")
+          if [ "$before" = "$after" ]; then
+            echo "The extension was not rebuilt: $ext"
+            exit 2
+          fi
+          bad=0
+          # test|text the failure must show (a7f8608 rejects array.array and has
+          # the old error text without "bytes-like objects")
+          for pair in \
+            "tests/test_database.py::test_array_blob_parameter[turso]|unexpected parameter value" \
+            "tests/test_database.py::test_unsupported_parameter_type_is_rejected|and bytes are supported"; do
+            t="${pair%%|*}"
+            want="${pair#*|}"
+            code=0
+            out=$(python -m pytest -q "$t" 2>&1) || code=$?
+            echo "$out"
+            if [ "$code" -eq 0 ]; then
+              echo "UNEXPECTED PASS without fix 2: $t"
+              bad=1
+            elif [ "$code" -eq 1 ] && echo "$out" | grep -q "$want"; then
+              echo "failed without fix 2, as expected: $t"
+            else
+              echo "WRONG FAILURE REASON (exit $code): $t"
+              bad=1
+            fi
+          done
+          exit $bad
